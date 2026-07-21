@@ -61,8 +61,8 @@ class _CastOutput(torch.nn.Module):
 
     Cosmos3's ``forward`` feeds ``time_proj`` sinusoids (always fp32 — diffusers'
     ``get_timestep_embedding`` calls ``.float()`` internally) straight into
-    ``time_embedder`` and relies on that embedder staying fp32. With the
-    transformer uniformly cast for FSDP2 the embedder is bf16, so restore the
+    ``time_embedder`` and relies on that embedder staying fp32. Under FSDP mixed
+    precision the embedder is all-gathered as bf16 for compute, so restore the
     standard diffusers convention (cast the projection before the linear).
     """
 
@@ -94,13 +94,22 @@ class Cosmos3Bundle:
         device = torch.device(config.device)
         model_dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
         vae_dtype = parse_torch_dtype(config.vae_precision, field_name="vae_precision")
+        # Storage / optimizer-master dtype (config.master_precision; fp32 default).
+        master_dtype = parse_torch_dtype(config.master_precision, field_name="master_precision")
 
-        transformer = Cosmos3OmniTransformer.from_pretrained(path, subfolder="transformer", torch_dtype=model_dtype)
-        # diffusers pins `time_embedder` to fp32 (_keep_in_fp32_modules), but FSDP2
-        # requires a uniform original dtype per param group — cast the whole module,
-        # matching the other UniRL bundles that run transformers fully in
-        # model_precision.
-        transformer = transformer.to(device=device, dtype=model_dtype)
+        # Load + store the transformer in `master_dtype`. Under `mixed_precision` the
+        # FSDP wrap all-gathers params as `param_dtype` (bf16) for COMPUTE, so this is
+        # purely the storage/optimizer-master dtype — fp32 = upstream's "fp32 master,
+        # bf16 compute" (bf16 master diverged on the action loss). Loading bf16 +
+        # recipe `master_dtype: fp32` can't work here: this recipe freezes half of
+        # every MoT block (understanding stream), and the wrap only upcasts
+        # TRAINABLE params, leaving each FSDP group with a mixed {bf16, fp32}
+        # dtype that FSDP2 rejects. A uniform LOAD dtype keeps every param uniform.
+        transformer = Cosmos3OmniTransformer.from_pretrained(path, subfolder="transformer", torch_dtype=master_dtype)
+        transformer = transformer.to(device=device, dtype=master_dtype)
+        # `time_proj` (get_timestep_embedding) always emits fp32 sinusoids; cast
+        # them to the COMPUTE dtype so they match the bf16-all-gathered
+        # `time_embedder` weights at forward time.
         transformer.time_proj = _CastOutput(transformer.time_proj, model_dtype)
         vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device)
         vae.requires_grad_(False)

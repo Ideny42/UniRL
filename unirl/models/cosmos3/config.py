@@ -23,7 +23,14 @@ class Cosmos3SFTConfig:
     pretrained_model_ckpt_path: str
 
     # -- precision / placement -------------------------------------------------
+    # Compute dtype (FSDP mixed-precision all-gathers params to this for the forward).
     model_precision: str = "bf16"
+    # Transformer STORAGE / optimizer-master dtype. "fp32" = upstream's "fp32 master,
+    # bf16 compute" (stable; default); "bf16" reproduces the original bf16 master
+    # (baseline ablation). Set as the LOAD dtype (not recipe FSDPConfig.master_dtype):
+    # freeze_understanding leaves each MoT layer with mixed frozen/trainable params and
+    # master_dtype only upcasts the trainable ones -> FSDP2 rejects the mixed group.
+    master_precision: str = "fp32"
     # WanVAE was trained with amp off; encode/decode run in the VAE's own dtype.
     vae_precision: str = "fp32"
     device: str = "cuda"
