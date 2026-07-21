@@ -3,9 +3,9 @@
 #
 # Mirrors Cosmos3-Nano-Policy-DROID's pretraining objective at debug scale:
 # latent frame 0 = clean observation, future video frames + the whole action
-# chunk are noised and jointly denoised; loss = vision MSE + 10x action MSE
-# (upstream action_loss_weight), sigma ~ logitnormal with flow_shift=5.0
-# (upstream action-recipe schedule).
+# chunk are noised and jointly denoised; loss = 10x vision MSE + 10x action MSE
+# (upstream balances 1:1: loss_scale=10 on vision + action_loss_weight=10),
+# sigma ~ logitnormal; flow_shift auto by resolution (tier-256 192x320 -> 3.0).
 #
 # NB droid_100 carries LeRobot's collapsed 7-D `action` field, not the 10-D
 # EE-pose layout the droid_lerobot domain head was pretrained on — fine for a
@@ -31,10 +31,11 @@ policy:
     model_precision: bf16
     vae_precision: fp32
     freeze_understanding: true
-    flow_shift: 5.0
+    # flow_shift unset -> auto by resolution (flow_shift_by_resolution: tier-256 192x320 -> 3.0)
     time_dist: logitnormal
     fps: 15.0
     condition_on_first_frame: true
+    vision_loss_weight: 10.0       # balance vs action (upstream loss_scale=10 on the vision term -> 1:1)
     action_domain_name: droid_lerobot
     action_chunk_size: 16
     raw_action_dim: 7
