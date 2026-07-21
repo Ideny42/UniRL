@@ -40,6 +40,7 @@ from unirl.models.cosmos3.packing import (
     noise_vision_latents,
     pack_joint_sequence,
     pad_action_chunk,
+    resolution_tier,
     sample_train_sigma,
 )
 
@@ -132,7 +133,7 @@ class Cosmos3SFTTaskBase:
             time_dist=cfg.time_dist,
             logitnormal_mean=cfg.logitnormal_mean,
             logitnormal_std=cfg.logitnormal_std,
-            shift=self.bundle.flow_shift,
+            shift=self._flow_shift(height, width),
             generator=generator,
             device=device,
         )
@@ -209,6 +210,33 @@ class Cosmos3SFTTaskBase:
     # Eval sampling (all FSDP ranks must enter together — collective weights)
     # ------------------------------------------------------------------
 
+    def _flow_shift(self, height: int, width: int) -> float:
+        """Resolution-aware flow shift. Explicit ``config.flow_shift`` overrides;
+        else look the sample's tier (short edge) up in ``flow_shift_by_resolution``
+        (mirrors upstream's per-resolution shift); else the checkpoint default."""
+        cfg = self.config
+        if cfg.flow_shift is None and cfg.flow_shift_by_resolution:
+            shift = cfg.flow_shift_by_resolution.get(resolution_tier(height, width))
+            if shift is not None:
+                return float(shift)
+        return float(self.bundle.flow_shift)
+
+    def _align_eval_flow_shift(self, height: int, width: int) -> None:
+        """Set the eval scheduler's flow_shift to the trained (resolution-aware) value.
+
+        ``Cosmos3OmniPipeline.__call__`` has no ``flow_shift`` arg and reads it
+        from ``scheduler.config`` at ``set_timesteps`` time. Without this, eval
+        denoises on the checkpoint scheduler's default shift, mismatching the
+        trained ``flow_shift`` (e.g. tier-256 trains at 3.0 but would eval on the
+        checkpoint default).
+        """
+        from diffusers import UniPCMultistepScheduler
+
+        shift = self._flow_shift(height, width)
+        sched = self.pipe.scheduler
+        if abs(float(getattr(sched.config, "flow_shift", shift)) - shift) > 1e-9:
+            self.pipe.scheduler = UniPCMultistepScheduler.from_config(sched.config, flow_shift=shift)
+
     @torch.no_grad()
     def sample(self, record: Dict[str, Any], *, generator: Optional[torch.Generator] = None) -> Dict[str, Any]:
         from PIL import Image as PILImage
@@ -224,6 +252,7 @@ class Cosmos3SFTTaskBase:
             "enable_safety_check": False,
             "use_system_prompt": cfg.use_system_prompt,
         }
+        self._align_eval_flow_shift(height, width)  # resolution-aware eval shift
         if self.train_action:
             from diffusers.pipelines.cosmos.pipeline_cosmos3_omni import CosmosActionCondition
 

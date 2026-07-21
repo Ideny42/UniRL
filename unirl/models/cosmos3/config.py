@@ -12,7 +12,7 @@ the gen stream (velocity prediction) and freezes the und stream by default.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -43,9 +43,16 @@ class Cosmos3SFTConfig:
     freeze_understanding: bool = True
 
     # -- flow-matching training schedule ----------------------------------------
-    # None -> read ``flow_shift`` from the checkpoint's scheduler config. The
-    # upstream action recipes run flow_shift=5.0; t2v checkpoints ship their own.
+    # Sigma shift (warp) applied after sampling. Upstream keys it by the SHORT edge
+    # of each sample: {"256": 3, "480": 5, "720": 10}.
+    #   flow_shift = None (default) -> look the tier up in ``flow_shift_by_resolution``
+    #     from each sample's (H, W) — mirrors upstream's per-resolution shift; falls
+    #     back to the checkpoint scheduler's shift if the tier is absent.
+    #   flow_shift = <float>        -> a fixed override for every sample.
     flow_shift: Optional[float] = None
+    # Resolution-keyed shift table (short-edge tier -> shift), used when flow_shift
+    # is None. droid100 is the tier-256 bin (192x320) -> 3.0; matches upstream.
+    flow_shift_by_resolution: dict = field(default_factory=lambda: {"256": 3.0, "480": 5.0, "720": 10.0})
     # Training-time sigma distribution before the shift warp:
     # "logitnormal" (sigmoid of N(mean, std), the upstream action-SFT choice)
     # or "uniform".

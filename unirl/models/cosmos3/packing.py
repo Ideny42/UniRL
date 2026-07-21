@@ -26,6 +26,22 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 
 
+def resolution_tier(height: int, width: int) -> str:
+    """Resolution tier from spatial dims, mirroring cosmos-framework's
+    ``get_vision_data_resolution``: keyed by the SHORT edge ``min(H, W)`` —
+    ``<=256 -> "256"``, ``<=640 -> "480"``, ``<=960 -> "720"``, else ``"768"``.
+    (Upstream's special-case for a few canonical 768 shapes like (1024, 1024) is
+    omitted; SFT here trains on the standard tier bins.)"""
+    min_dim = min(int(height), int(width))
+    if min_dim <= 256:
+        return "256"
+    if min_dim <= 640:
+        return "480"
+    if min_dim <= 960:
+        return "720"
+    return "768"
+
+
 def sample_train_sigma(
     *,
     time_dist: str,
@@ -187,5 +203,6 @@ __all__ = [
     "noise_vision_latents",
     "pack_joint_sequence",
     "pad_action_chunk",
+    "resolution_tier",
     "sample_train_sigma",
 ]
