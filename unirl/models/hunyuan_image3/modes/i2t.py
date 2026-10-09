@@ -40,7 +40,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         )
     images = require_single_images(image_inputs[0], context="HunyuanImage3Pipeline.generate (i2t)")
 
-    model_cfg: Dict[str, Any] = dict((sample.parts[0].control or {}).get("ar") or {})
+    model_cfg: Dict[str, Any] = dict(sample.parts[0].control.get("ar") or {})
     ar_params = HunyuanImage3ARParams(
         max_tokens=ar.max_new_tokens if ar is not None else model_cfg.get("max_tokens", 2048),
         temperature=ar.temperature if ar is not None else model_cfg.get("temperature", 0.6),

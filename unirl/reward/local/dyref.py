@@ -45,13 +45,8 @@ def _target_image_uris(request: RewardRequest) -> List[str]:
 
 
 def _reference_rows(request: RewardRequest) -> List[List[Image.Image]]:
-    """Convert the single ordered condition-image turn to per-sample PIL rows."""
-    if len(request.image_references) != 1:
-        raise ValueError(
-            "DyRef rewards require exactly one user image turn containing all ordered references; "
-            f"got {len(request.image_references)}."
-        )
-    references = request.image_references[0]
+    """Convert the ordered condition-image turn to per-sample PIL rows."""
+    references = request.conditioning.get("image")
     if isinstance(references, ImageSets):
         rows = references.to_pil_rows()
     elif isinstance(references, Images):
