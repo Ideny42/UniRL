@@ -56,8 +56,11 @@ def load_model_state_dict(
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
     """Rank-0 DCP optimizer gather; never-updated AdamW params export as step-0 zero state."""
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
     options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
-    full = _export_optimizer_state_dict(model, optimizer, options=options)
+    with fresh_adamw_state(optimizer):
+        full = get_optimizer_state_dict(model, optimizer, options=options)
     return full if _current_rank() == 0 else {}
 
 
@@ -87,13 +90,23 @@ def load_optimizer_state_dict(
     broadcast_from_rank0: bool = True,
 ) -> None:
     """Load a full optimizer state dict and reshard it into ``optimizer``."""
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
     options = _build_state_dict_options(
         full_state_dict=True,
         broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
     )
-    _mark_omitted_adamw_state_fresh(optimizer, state_dict)
-    _set_optimizer_state_dict(model, optimizer, state_dict, options=options)
+    if isinstance(optimizer, torch.optim.AdamW) and "state" in state_dict:
+        # Sparse checkpoints list never-updated params without state; a step-0 entry is dropped back to lazy init.
+        for group in state_dict["param_groups"]:
+            for name in group["params"]:
+                state_dict["state"].setdefault(name, {"step": torch.tensor(0.0)})
+    try:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
+    except TypeError:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+    _drop_fresh_adamw_state(optimizer)
 
 
 def sharded_model_state_dict(model: nn.Module) -> StateDict:
@@ -109,8 +122,11 @@ def sharded_model_state_dict(model: nn.Module) -> StateDict:
 
 def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
     """Per-rank sharded optimizer state for DCP; never-updated AdamW params export as step-0 zero state."""
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
     options = _build_state_dict_options(full_state_dict=False)
-    return _export_optimizer_state_dict(model, optimizer, options=options)
+    with fresh_adamw_state(optimizer):
+        return get_optimizer_state_dict(model, optimizer, options=options)
 
 
 def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
@@ -128,8 +144,14 @@ def load_sharded_optimizer_state_dict(
     model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict
 ) -> None:
     """Load a per-rank sharded optimizer state read by ``dcp.load`` in place."""
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
     options = _build_state_dict_options(full_state_dict=False)
-    _set_optimizer_state_dict(model, optimizer, state_dict, options=options)
+    try:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
+    except TypeError:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+    _drop_fresh_adamw_state(optimizer)
 
 
 @contextmanager
@@ -138,15 +160,19 @@ def fresh_adamw_state(optimizer: torch.optim.Optimizer) -> Iterator[None]:
     added: List[Parameter] = []
     if isinstance(optimizer, torch.optim.AdamW):
         for group in optimizer.param_groups:
+            moments = ("exp_avg", "exp_avg_sq", "max_exp_avg_sq") if group["amsgrad"] else ("exp_avg", "exp_avg_sq")
             for param in group["params"]:
-                if param.requires_grad and not optimizer.state.get(param):
-                    optimizer.state[param] = _fresh_adamw_entry(param, group)
+                if param not in optimizer.state:
+                    optimizer.state[param] = {
+                        "step": torch.tensor(0.0),
+                        **{k: torch.zeros_like(param) for k in moments},
+                    }
                     added.append(param)
     try:
         yield
     finally:
         for param in added:
-            optimizer.state.pop(param, None)
+            del optimizer.state[param]
 
 
 def drop_meta_entries(state_dict: StateDict) -> StateDict:
@@ -250,63 +276,13 @@ def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
     return converted
 
 
-def _fresh_adamw_entry(param: Parameter, group: Dict[str, object]) -> Dict[str, torch.Tensor]:
-    """The state ``torch.optim.AdamW`` creates on a param's first update."""
-    if group["capturable"] or group["fused"]:
-        step = torch.zeros((), dtype=torch.float32, device=param.device)
-    else:
-        step = torch.tensor(0.0)
-    entry = {"step": step, "exp_avg": torch.zeros_like(param), "exp_avg_sq": torch.zeros_like(param)}
-    if group["amsgrad"]:
-        entry["max_exp_avg_sq"] = torch.zeros_like(param)
-    return entry
-
-
-def _mark_omitted_adamw_state_fresh(optimizer: torch.optim.Optimizer, state_dict: StateDict) -> None:
-    """Give params a sparse full checkpoint listed without state a step-0 entry, so the load drops them."""
-    if not isinstance(optimizer, torch.optim.AdamW) or "state" not in state_dict:
-        return
-    for group in state_dict["param_groups"]:
-        for name in group["params"]:
-            state_dict["state"].setdefault(name, {"step": torch.tensor(0.0)})
-
-
 def _drop_fresh_adamw_state(optimizer: torch.optim.Optimizer) -> None:
     """Return step-0 AdamW entries to lazy init; their moments are zero, so the next update is unchanged."""
     if not isinstance(optimizer, torch.optim.AdamW):
         return
-    fresh = [param for param, entry in optimizer.state.items() if entry and float(entry["step"]) == 0]
+    fresh = [param for param, entry in optimizer.state.items() if float(entry["step"]) == 0]
     for param in fresh:
         del optimizer.state[param]
-
-
-def _set_optimizer_state_dict(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    state_dict: StateDict,
-    *,
-    options: object,
-) -> None:
-    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
-
-    try:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
-    except TypeError:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
-    _drop_fresh_adamw_state(optimizer)
-
-
-def _export_optimizer_state_dict(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    *,
-    options: object,
-) -> StateDict:
-    """Export a dense AdamW state without advancing any param's clock."""
-    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
-
-    with fresh_adamw_state(optimizer):
-        return get_optimizer_state_dict(model, optimizer, options=options)
 
 
 __all__ = [
