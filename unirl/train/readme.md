@@ -75,9 +75,19 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.
-- **Checkpointing preserves a never-stepped AdamW** — DCP materializes empty
-  optimizer state with a dummy step; UniRL resets it so the first real update
-  remains step 1.
+- **Checkpointing preserves never-stepped and never-updated AdamW params** —
+  DCP dummy-steps a fully cold AdamW; UniRL resets that clock to 0 so the first
+  real update remains step 1. A partially initialized AdamW may omit never-updated
+  params from `state` while still listing them in `param_groups`; stock
+  `set_optimizer_state_dict` then KeyErrors on resume. UniRL inserts `{}` for
+  those names at the shared export/load boundary and drops the dummy state that
+  a full-state load would otherwise materialize at `step=1`. A gathered load
+  broadcasts that name list from rank 0 first, so every rank stays lazily
+  uninitialized. Existing `step` / `exp_avg` / `exp_avg_sq` tensors are left
+  unchanged; a half-present entry is not repaired. DCP files only store tensors,
+  so unused params never appear on disk; resume into a cold DCP template still
+  missing-keys those names. Torch-format checkpoints store the empty mappings
+  and are the supported sparse resume path.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an

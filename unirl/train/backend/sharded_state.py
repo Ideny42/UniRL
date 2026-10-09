@@ -54,7 +54,7 @@ def load_model_state_dict(
 
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Rank-0 DCP optimizer gather; preserves cold AdamW state."""
+    """Rank-0 DCP optimizer gather; preserves cold and sparse AdamW state."""
     options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
     full = _export_optimizer_state_dict(model, optimizer, options=options)
     return full if _current_rank() == 0 else {}
@@ -85,18 +85,19 @@ def load_optimizer_state_dict(
     *,
     broadcast_from_rank0: bool = True,
 ) -> None:
-    """Load a full optimizer state dict and reshard it into ``optimizer``."""
-    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
-
+    """Load a full optimizer state dict; absent AdamW entries stay lazily uninitialized."""
     options = _build_state_dict_options(
         full_state_dict=True,
         broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
     )
-    try:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
-    except TypeError:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+    _set_optimizer_state_dict(
+        model,
+        optimizer,
+        state_dict,
+        options=options,
+        share_uninitialized=broadcast_from_rank0,
+    )
 
 
 def sharded_model_state_dict(model: nn.Module) -> StateDict:
@@ -111,7 +112,7 @@ def sharded_model_state_dict(model: nn.Module) -> StateDict:
 
 
 def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Per-rank sharded optimizer state for DCP; preserves cold AdamW state."""
+    """Per-rank sharded optimizer state for DCP; preserves cold and sparse AdamW state."""
     options = _build_state_dict_options(full_state_dict=False)
     return _export_optimizer_state_dict(model, optimizer, options=options)
 
@@ -130,14 +131,9 @@ def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, st
 def load_sharded_optimizer_state_dict(
     model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict
 ) -> None:
-    """Load a per-rank sharded optimizer state read by ``dcp.load`` in place."""
-    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
-
+    """Load a per-rank sharded optimizer state; absent AdamW entries stay lazily uninitialized."""
     options = _build_state_dict_options(full_state_dict=False)
-    try:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
-    except TypeError:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+    _set_optimizer_state_dict(model, optimizer, state_dict, options=options, share_uninitialized=False)
 
 
 def drop_meta_entries(state_dict: StateDict) -> StateDict:
@@ -241,13 +237,80 @@ def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
     return converted
 
 
+def _fill_missing_optimizer_state(state_dict: StateDict) -> tuple[object, ...]:
+    """Insert ``{}`` for missing ``param_groups`` names and return those names."""
+    state = state_dict.get("state")
+    groups = state_dict.get("param_groups")
+    if not isinstance(state, dict) or not isinstance(groups, (list, tuple)):
+        return ()
+    empty: list[object] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        params = group.get("params")
+        if not isinstance(params, (list, tuple)):
+            continue
+        for name in params:
+            if not state.get(name):
+                empty.append(name)
+                state[name] = {}
+    return tuple(empty)
+
+
+def _drop_uninitialized_optimizer_state(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    names: tuple[object, ...],
+) -> None:
+    """Clear live optimizer state for checkpoint names whose entry was ``{}``."""
+    if not names:
+        return
+    named = dict(model.named_parameters())
+    for name in names:
+        param = named.get(name)
+        if param is not None:
+            optimizer.state.pop(param, None)
+
+
+def _broadcast_uninitialized_names(names: tuple[object, ...]) -> tuple[object, ...]:
+    """Broadcast rank-0's empty optimizer names so every rank drops the same params."""
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        return names
+    payload: list[object] = [list(names) if dist.get_rank() == 0 else None]
+    dist.broadcast_object_list(payload, src=0)
+    shared = payload[0]
+    return tuple(shared) if isinstance(shared, list) else ()
+
+
+def _set_optimizer_state_dict(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    state_dict: StateDict,
+    *,
+    options: object,
+    share_uninitialized: bool,
+) -> None:
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
+    uninitialized = _fill_missing_optimizer_state(state_dict)
+    if share_uninitialized:
+        uninitialized = _broadcast_uninitialized_names(uninitialized)
+    try:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
+    except TypeError:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+    _drop_uninitialized_optimizer_state(model, optimizer, uninitialized)
+
+
 def _export_optimizer_state_dict(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     *,
     options: object,
 ) -> StateDict:
-    """Export without advancing a cold AdamW clock."""
+    """Export without advancing a cold AdamW clock or inventing unused-param moments."""
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
     cold = (
@@ -260,6 +323,7 @@ def _export_optimizer_state_dict(
         if cold:
             for entry in exported.get("state", {}).values():
                 entry["step"] = torch.zeros_like(entry["step"])
+        _fill_missing_optimizer_state(exported)
         return exported
     finally:
         if cold:
